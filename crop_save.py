@@ -87,3 +87,41 @@ if result.failures:
 
 CONFIG.storage = _orig
 spark.sql("SHOW TABLES IN docextract.reporting LIKE 'v5_*'").show(truncate=False)
+
+def _enhance_for_vision(region, ImageEnhance, ImageFilter, Image, target_min=1400,
+                        max_scale=3):
+    """Make a chart crop more legible for the vision model: upscale small crops
+    with LANCZOS, then apply light sharpening and a slight contrast lift. Moderate
+    on purpose -- over-sharpening introduces artifacts. Scales BOTH dimensions by
+    the same factor (aspect ratio preserved -- no squeezing/distortion). Returns
+    the enhanced image; on any error returns the original (never fails the crop)."""
+    try:
+        w, h = region.size
+        if w <= 0 or h <= 0:
+            return region
+        # upscale so the width reaches ~target_min px (capped), keeping aspect ratio
+        if w < target_min:
+            scale = min(max_scale, max(1, round(target_min / w)))
+            if scale > 1:
+                region = region.resize((w * scale, h * scale), Image.LANCZOS)
+        # light unsharp mask (better than plain Sharpness for text/edges)
+        region = region.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+        # slight contrast lift to separate text from background
+        region = ImageEnhance.Contrast(region).enhance(1.08)
+        return region
+    except Exception:
+        return region
+
+    from PIL import Image, ImageEnhance, ImageFilter
+    import base64 as _b64, io as _io, json as _json
+
+            # ENHANCE the crop for Sonnet: chart crops are often small/blurry
+            # (the source page renders at limited resolution). Upscaling with a
+            # high-quality filter + light sharpening/contrast makes the text and
+            # data points more legible for the vision model.
+            region = _enhance_for_vision(region, ImageEnhance, ImageFilter, Image)
+
+            buf = _io.BytesIO()
+            region.save(buf, format="PNG")
+            buf.seek(0)
+            return _b64.b64encode(buf.read()).decode()
