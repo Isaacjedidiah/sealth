@@ -125,3 +125,195 @@ def _enhance_for_vision(region, ImageEnhance, ImageFilter, Image, target_min=140
             region.save(buf, format="PNG")
             buf.seek(0)
             return _b64.b64encode(buf.read()).decode()
+
+# FILE 1: hybrid_extraction.py
+
+# Edit 1 — add the firm_xaxis_cfg parameter. Find:
+                            vision_model_key: str = "tier2",
+                            use_sonnet: bool = False) -> list:
+
+# Edit 2 — add the position-capturing prompt. Find:
+CHART_DIGITISATION_PROMPT = (
+
+# Add this right before it:
+# For the firm-specific x-axis case: the SAME single call also returns each point's
+# x-position and the printed x-axis labels + positions, so the geometry can
+# resolve periods IN-MEMORY without a second Sonnet call (no doubled calls).
+CHART_DIGITISATION_PROMPT_WITH_POS = (
+    "You are a chart digitisation engine. Read ONLY the CHARTS and GRAPHS in this "
+    "image and return their data points as a JSON array \u2014 no prose:\n"
+    '[{"label": "<chart title | series name from legend | category/x-axis label>", '
+    '"value": <number>, "unit": "<%/\u00a3m/bps/count/etc>", '
+    '"x_center": <approx horizontal PIXEL position of this bar/point centre>}]\n'
+    "ALSO return the printed x-axis labels with their positions as a SECOND array "
+    'under the key "xlabels": [{"text": "<label e.g. Jan 2025>", "x_center": <pixel>}].\n'
+    "Return a JSON object: {\"points\": [...], \"xlabels\": [...]}. Use the number "
+    "PRINTED on/beside each bar/point exactly; do not estimate from the axis scale."
+)
+
+
+CHART_DIGITISATION_PROMPT = (
+
+# Edit 3 — add the single-call helper. Find:
+            def sonnet_points_to_claims(points: list[dict], el: ParsedElement, filename: str,
+# Add this right before it:
+def _sonnet_read_image_with_pos(run_async_fn, llm_client, model_key, content, img_b64):
+    """ONE Sonnet call that returns chart points (value + x_center) AND the printed
+    x-axis labels (text + x_center), for the firm-specific geometry. Returns
+    (points, xlabels). No second call. Sends the ai_parse `content` (description)
+    like the normal read, so context is preserved."""
+    import json as _json, re as _re
+    try:
+        from ..shared.llm_client import EXTRACTION_TOOL_SCHEMA
+    except Exception:
+        EXTRACTION_TOOL_SCHEMA = {"name": "extract"}
+    try:
+        resp = run_async_fn(llm_client.extract(
+            model_key, CHART_DIGITISATION_PROMPT_WITH_POS, content or "",
+            EXTRACTION_TOOL_SCHEMA, image_base64=img_b64))
+    except Exception:
+        return [], []
+    ta = getattr(resp, "tool_arguments", None)
+    data = ta if isinstance(ta, dict) else None
+    if data is None:
+        txt = getattr(resp, "text", "") or ""
+        m = _re.search(r"\{.*\}", txt, _re.S)
+        try:
+            data = _json.loads(m.group(0)) if m else {}
+        except Exception:
+            data = {}
+    points = (data.get("points") or data.get("claims") or data.get("data") or [])
+    xlabels = data.get("xlabels") or data.get("labels") or []
+    norm = []
+    for p in points if isinstance(points, list) else []:
+        if isinstance(p, dict):
+            norm.append({"label": p.get("label") or p.get("field_name") or "",
+                         "value": p.get("value"),
+                         "x_center": p.get("x_center")})
+    return norm, (xlabels if isinstance(xlabels, list) else [])
+
+# Edit 4 — replace the figure-read block. Find:
+                pts = _sonnet_read_image(
+                    run_async_fn, llm_client, vision_model_key,
+                    CHART_DIGITISATION_PROMPT, content, img_b64)
+                if pts:
+                    claims.extend(sonnet_points_to_claims(pts, el, filename, entity_ref))
+                else:
+                    claims.extend(desc_claims)   # vision found nothing -> keep desc
+# Replace with:
+                # For the FIRM-SPECIFIC x-axis case, one call returns values AND
+                # positions; the geometry then resolves periods IN-MEMORY (no 2nd
+                # Sonnet call -> no doubled calls / throttling). Otherwise the
+                # normal single read.
+                if firm_xaxis_cfg:
+                    pts, xlabels = _sonnet_read_image_with_pos(
+                        run_async_fn, llm_client, vision_model_key, content, img_b64)
+                    if pts:
+                        fig_claims = sonnet_points_to_claims(pts, el, filename, entity_ref)
+                        try:
+                            from .firm_xaxis import resolve_axis_labels
+                            bars = [{"id": i, "series": p.get("label", ""),
+                                     "value": str(p.get("value", "")),
+                                     "x_center": p.get("x_center", 0)}
+                                    for i, p in enumerate(pts) if p.get("x_center") is not None]
+                            labs = [{"text": l.get("text", ""), "x_center": l.get("x_center", 0)}
+                                    for l in (xlabels or []) if l.get("x_center") is not None]
+                            if bars and labs:
+                                id_to_period, status = resolve_axis_labels(
+                                    bars, labs,
+                                    monthly_step=firm_xaxis_cfg.get("monthly_step", 1),
+                                    x_tolerance=firm_xaxis_cfg.get("x_tolerance", 8))
+                                if status in ("geometry", "geometry_month"):
+                                    vp = {}
+                                    for i, p in enumerate(pts):
+                                        per = id_to_period.get(i)
+                                        if per and per != "FLAG_REVIEW":
+                                            vp[(str(p.get("label", "")), str(p.get("value", "")))] = per
+                                    for cl in fig_claims:
+                                        per = vp.get((str(getattr(cl, "field_name", "") or ""),
+                                                      str(getattr(cl, "value", "") or "")))
+                                        if per:
+                                            setattr(cl, "as_at_date", per)
+                        except Exception:
+                            pass
+                        claims.extend(fig_claims)
+                    else:
+                        claims.extend(desc_claims)
+                else:
+                    pts = _sonnet_read_image(
+                        run_async_fn, llm_client, vision_model_key,
+                        CHART_DIGITISATION_PROMPT, content, img_b64)
+                    if pts:
+                        claims.extend(sonnet_points_to_claims(pts, el, filename, entity_ref))
+                    else:
+                        claims.extend(desc_claims)   # vision found nothing -> keep desc
+
+# FILE 2: ai_parse_pipeline.py
+
+# Edit — resolve the config and pass it. Find:
+
+            claims = hybrid_extract_document(
+                ai_parse_response=parsed, filename=fname,
+                team=sub["team"], report_type=sub["report_type"],
+                entity_ref=sub.get("entity_ref"),
+                use_sonnet=option_a, llm_client=llm_client,
+                run_async_fn=run_async_fn, crop_figure_image=crop_fn)
+# Replace with:
+            # firm-specific x-axis geometry config (None -> normal path, no-op).
+            # Resolved here so the SINGLE-call position read + in-memory geometry
+            # applies only to the configured firm.
+            _fx_cfg = None
+            try:
+                from .firm_xaxis import _firm_config
+                from .entity_path import parse_entity_path as _pep
+                _ent = _pep(path)
+                _fx_cfg = _firm_config(
+                    firm_id=sub.get("entity_id") or _ent.get("entity_id"),
+                    firm_name=sub.get("entity_name") or _ent.get("entity_name"))
+            except Exception:
+                _fx_cfg = None
+
+            claims = hybrid_extract_document(
+                ai_parse_response=parsed, filename=fname,
+                team=sub["team"], report_type=sub["report_type"],
+                entity_ref=sub.get("entity_ref"),
+                use_sonnet=option_a, llm_client=llm_client,
+                run_async_fn=run_async_fn, crop_figure_image=crop_fn,
+                firm_xaxis_cfg=_fx_cfg)
+
+# hybrid_extraction
+# Find this (the start of _sonnet_read_image_with_pos):
+    import json as _json, re as _re
+    try:
+        from ..shared.llm_client import EXTRACTION_TOOL_SCHEMA
+    except Exception:
+        EXTRACTION_TOOL_SCHEMA = {"name": "extract"}
+    try:
+        resp = run_async_fn(llm_client.extract(
+            model_key, CHART_DIGITISATION_PROMPT_WITH_POS, content or "",
+            EXTRACTION_TOOL_SCHEMA, image_base64=img_b64))
+    except Exception:
+        return [], []
+# Replace with:
+    import json as _json, re as _re
+    # CUSTOM schema matching the WITH_POS prompt (points + xlabels) -- NOT the
+    # normal claims schema, so x-axis LABELS never leak into the claims/gold.
+    _POS_SCHEMA = {
+        "name": "record_chart_with_positions",
+        "description": "Chart data points (value + x position) and x-axis labels (text + x position).",
+        "parameters": {"type": "object", "properties": {
+            "points": {"type": "array", "items": {"type": "object", "properties": {
+                "label": {"type": "string"}, "value": {"type": "string"},
+                "unit": {"type": "string"}, "x_center": {"type": "number"}},
+                "required": ["value", "x_center"]}},
+            "xlabels": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string"}, "x_center": {"type": "number"}},
+                "required": ["text", "x_center"]}},
+        }, "required": ["points"]},
+    }
+    try:
+        resp = run_async_fn(llm_client.extract(
+            model_key, CHART_DIGITISATION_PROMPT_WITH_POS, content or "",
+            _POS_SCHEMA, image_base64=img_b64))
+    except Exception:
+        return [], []
