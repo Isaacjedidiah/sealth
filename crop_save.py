@@ -317,3 +317,105 @@ def _sonnet_read_image_with_pos(run_async_fn, llm_client, model_key, content, im
             _POS_SCHEMA, image_base64=img_b64))
     except Exception:
         return [], []
+
+# inspect
+
+# =============================================================================
+#  ONE script to check THREE things from ai_parse_document output:
+#   1. CONFIDENCE  — is there a score, and is it LOW on bad tables?
+#   2. FOOTNOTE/LEGEND — what text does ai_parse give for legends?
+#   3. BEAUTIFULSOUP — does it parse a malformed table better than our parser?
+#  Handles the VariantVal type (to_json -> json.loads).
+# =============================================================================
+import json
+from collections import Counter
+
+DOC = "/Volumes/<catalog>/<schema>/<volume>/docs/your_doc.pptx"   # <-- set this
+IMG_OUT = "/Volumes/<catalog>/<schema>/<volume>/inspect_imgs"
+dbutils.fs.mkdirs(IMG_OUT)
+
+# ---- run ai_parse + convert VARIANT to a plain dict ----
+spark.sql("CREATE OR REPLACE TEMP VIEW _insp AS "
+          f"SELECT * FROM READ_FILES('{DOC}', format => 'binaryFile')")
+df = spark.sql(f"""
+    SELECT ai_parse_document(content,
+        map('version','2.0','imageOutputPath','{IMG_OUT}')) AS parsed
+    FROM _insp
+""")
+d = json.loads(df.selectExpr("to_json(parsed) AS js").collect()[0]["js"])
+elements = d.get("document", d).get("elements", [])
+print(f"Total elements: {len(elements)}")
+print("Types:", dict(Counter(e.get('type') for e in elements)), "\n")
+
+
+# =============================================================================
+# 1. CONFIDENCE
+# =============================================================================
+print("=" * 60)
+print("1. CONFIDENCE")
+print("=" * 60)
+found_conf = False
+for i, e in enumerate(elements):
+    # element-level
+    cf = {k: v for k, v in e.items() if "conf" in k.lower() or "score" in k.lower()}
+    # bbox-level
+    bb = e.get("bbox")
+    if bb and isinstance(bb, list) and isinstance(bb[0], dict):
+        cf.update({f"bbox.{k}": v for k, v in bb[0].items()
+                   if "conf" in k.lower() or "score" in k.lower()})
+    if cf:
+        found_conf = True
+        print(f"  [{i}] type={e.get('type')}  {cf}")
+if not found_conf:
+    print("  No confidence/score fields found at element or bbox level.")
+    print("  -> printing ALL keys of the first table so you can look manually:")
+    for e in elements:
+        if e.get("type") == "table":
+            print("  table keys:", list(e.keys()))
+            break
+print(">>> KEY TEST: on a table you KNOW was misread, is confidence LOW?")
+print(">>> If low on bad tables -> reliable. If high -> OCR confidently wrong -> not useful.\n")
+
+
+# =============================================================================
+# 2. FOOTNOTE / LEGEND text
+# =============================================================================
+print("=" * 60)
+print("2. FOOTNOTE / LEGEND / CAPTION (legend-as-text check)")
+print("=" * 60)
+for i, e in enumerate(elements):
+    t = e.get("type", "")
+    content = e.get("content") or e.get("text") or e.get("description") or ""
+    if t in ("footnote", "legend", "caption") or "legend" in str(content).lower():
+        print(f"  [{i}] type={t}")
+        print(f"      text: {str(content)[:250]}")
+print(">>> Does the legend text have series names + colours ('Blue = Revenue')")
+print(">>> or just names, or is it a source note? That decides legend-as-text.\n")
+
+
+# =============================================================================
+# 3. BEAUTIFULSOUP vs our parser on a table's HTML
+# =============================================================================
+print("=" * 60)
+print("3. BEAUTIFULSOUP on a table's HTML")
+print("=" * 60)
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    import subprocess, sys
+    subprocess.run([sys.executable, "-m", "pip", "install", "beautifulsoup4", "--quiet"])
+    from bs4 import BeautifulSoup
+
+tables = [e for e in elements if e.get("type") == "table"]
+if tables:
+    html = tables[0].get("content") or tables[0].get("html") or ""
+    print(f"  (first table HTML, {len(html)} chars)\n")
+    soup = BeautifulSoup(html, "html.parser")
+    for ri, tr in enumerate(soup.find_all("tr")):
+        cells = tr.find_all(["td", "th"])
+        row = [(c.get_text(strip=True)[:15], c.get("colspan"), c.get("rowspan")) for c in cells]
+        print(f"  row {ri}: {row}")
+    print("\n>>> Compare this row/cell/span structure to what our parser produces.")
+    print(">>> Does BeautifulSoup give a cleaner/more correct structure on malformed tables?")
+else:
+    print("  No tables found in this document.")
