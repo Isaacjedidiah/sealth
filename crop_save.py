@@ -419,3 +419,130 @@ if tables:
     print(">>> Does BeautifulSoup give a cleaner/more correct structure on malformed tables?")
 else:
     print("  No tables found in this document.")
+
+# another inspect all
+
+# =============================================================================
+#  Inspect ai_parse_document output — each check has ITS OWN page setting:
+#   1. CONFIDENCE      — on CONF_PAGE
+#   2. FOOTNOTE/LEGEND — on FOOT_PAGE
+#   3. BEAUTIFULSOUP   — on BS_PAGE
+#  Set each to a page number, or None for all pages.
+#  Handles the VariantVal type (to_json -> json.loads).
+# =============================================================================
+import json
+from collections import Counter
+
+DOC = "/Volumes/<catalog>/<schema>/<volume>/docs/your_doc.pptx"   # <-- set this
+IMG_OUT = "/Volumes/<catalog>/<schema>/<volume>/inspect_imgs"
+
+# ---- SET THE PAGE FOR EACH CHECK (None = all pages) ----
+CONF_PAGE = None    # page for the CONFIDENCE check
+FOOT_PAGE = None    # page for the FOOTNOTE/LEGEND check
+BS_PAGE   = None    # page for the BEAUTIFULSOUP check
+
+dbutils.fs.mkdirs(IMG_OUT)
+
+# ---- run ai_parse + convert VARIANT to a plain dict ----
+spark.sql("CREATE OR REPLACE TEMP VIEW _insp AS "
+          f"SELECT * FROM READ_FILES('{DOC}', format => 'binaryFile')")
+df = spark.sql(f"""
+    SELECT ai_parse_document(content,
+        map('version','2.0','imageOutputPath','{IMG_OUT}')) AS parsed
+    FROM _insp
+""")
+d = json.loads(df.selectExpr("to_json(parsed) AS js").collect()[0]["js"])
+elements = d.get("document", d).get("elements", [])
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    import subprocess, sys
+    subprocess.run([sys.executable, "-m", "pip", "install", "beautifulsoup4", "--quiet"])
+    from bs4 import BeautifulSoup
+
+def _page(e):
+    bb = e.get("bbox")
+    if bb and isinstance(bb, list) and isinstance(bb[0], dict):
+        return bb[0].get("page_id")
+    return None
+
+def _conf(e):
+    for k, v in e.items():
+        if ("conf" in k.lower() or "score" in k.lower()) and isinstance(v, (int, float)):
+            return v, k
+    bb = e.get("bbox")
+    if bb and isinstance(bb, list) and isinstance(bb[0], dict):
+        for k, v in bb[0].items():
+            if ("conf" in k.lower() or "score" in k.lower()) and isinstance(v, (int, float)):
+                return v, f"bbox.{k}"
+    return None, None
+
+def _content(e):
+    return e.get("content") or e.get("html") or e.get("text") or e.get("description") or ""
+
+def _on_page(e, pg):
+    return pg is None or _page(e) == pg
+
+pages = sorted({_page(e) for e in elements if _page(e) is not None})
+print(f"Total elements: {len(elements)}  |  pages available: {pages}")
+print("Types:", dict(Counter(e.get('type') for e in elements)))
+
+
+# =============================================================================
+# 1. CONFIDENCE  (on CONF_PAGE)
+# =============================================================================
+print("\n" + "=" * 60)
+print(f"1. CONFIDENCE  (page = {CONF_PAGE if CONF_PAGE is not None else 'ALL'})")
+print("=" * 60)
+tbls = [e for e in elements if e.get("type") == "table" and _on_page(e, CONF_PAGE)]
+if not tbls:
+    print("  (no tables on this page)")
+for j, e in enumerate(tbls):
+    cv, ck = _conf(e)
+    snip = " ".join(str(_content(e)).split())[:180]
+    print(f"\n  table {j} (page {_page(e)}): confidence={cv} (field={ck})")
+    print(f"    content: {snip}")
+print("\n  >>> find the BAD table by content; is its confidence LOWER than good ones?")
+
+
+# =============================================================================
+# 2. FOOTNOTE / LEGEND  (on FOOT_PAGE)
+# =============================================================================
+print("\n" + "=" * 60)
+print(f"2. FOOTNOTE / LEGEND  (page = {FOOT_PAGE if FOOT_PAGE is not None else 'ALL'})")
+print("=" * 60)
+found = False
+for e in elements:
+    if not _on_page(e, FOOT_PAGE):
+        continue
+    t = e.get("type", "")
+    cont = _content(e)
+    if t in ("footnote", "legend", "caption") or "legend" in str(cont).lower():
+        found = True
+        print(f"  type={t} (page {_page(e)}): {str(cont)[:250]}")
+if not found:
+    print("  (no footnote/legend/caption on this page)")
+print("\n  >>> does the legend text have series names + colours (legend-as-text)?")
+
+
+# =============================================================================
+# 3. BEAUTIFULSOUP  (on BS_PAGE)
+# =============================================================================
+print("\n" + "=" * 60)
+print(f"3. BEAUTIFULSOUP  (page = {BS_PAGE if BS_PAGE is not None else 'ALL'})")
+print("=" * 60)
+bs_tbls = [e for e in elements if e.get("type") == "table" and _on_page(e, BS_PAGE)]
+if not bs_tbls:
+    print("  (no table on this page)")
+for j, e in enumerate(bs_tbls):
+    html = _content(e)
+    soup = BeautifulSoup(str(html), "html.parser")
+    rows = soup.find_all("tr")
+    print(f"\n  table {j} (page {_page(e)}, {len(rows)} rows):")
+    for ri, tr in enumerate(rows[:8]):
+        cells = tr.find_all(["td", "th"])
+        print(f"    row {ri}: " +
+              str([(c.get_text(strip=True)[:14], c.get('colspan'), c.get('rowspan'))
+                   for c in cells]))
+print("\n  >>> compare BeautifulSoup's rows/spans to our parser on malformed tables.")
