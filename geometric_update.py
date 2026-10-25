@@ -165,3 +165,96 @@ def _sonnet_read_image_with_pos(
                             chart_title, pts, xlabels, el, filename, entity_ref,
                             firm_xaxis_cfg, title=title)
                         claims.extend(fig_claims)
+################## UPDATE 20261025 ################################
+# CHANGE 1 — replace the _sonnet_read_image_with_pos parsing block. Find:
+    # tolerate the points living under a few keys
+    points = (data.get("points") or data.get("claims") or data.get("data") or [])
+    xlabels = data.get("xlabels") or data.get("labels") or []
+    # normalise point field names (label/value/x_center)
+    norm = []
+    for p in points if isinstance(points, list) else []:
+        if isinstance(p, dict):
+            norm.append({"label": p.get("label") or p.get("field_name") or "",
+                         "value": p.get("value"),
+                         "x_center": p.get("x_center")})
+    return norm, (xlabels if isinstance(xlabels, list) else [])
+
+# Replace with
+    if not isinstance(data, dict):
+        data = {}
+    title = str(data.get("title") or "").strip()
+    points = (data.get("points") or data.get("claims") or data.get("data") or [])
+    xlabels = data.get("xlabels") or data.get("labels") or []
+    # DEFENSIVE: if Sonnet ignored the schema and returned period-keyed objects
+    # (e.g. {"title":..., "July": {"Revenue": 80, "Cost": 30}, ...}) instead of a
+    # points array, flatten them into points so nothing is lost. Each period key
+    # with a dict of series->value becomes points with that period as an xlabel.
+    if not points:
+        flat_pts, flat_labels, _idx = [], [], 0
+        for k, v in data.items():
+            if k in ("title", "points", "xlabels", "labels", "claims", "data"):
+                continue
+            if isinstance(v, dict):                       # period -> {series: value}
+                for series, val in v.items():
+                    if isinstance(val, (int, float, str)):
+                        flat_pts.append({"series": series, "value": val,
+                                         "x_center": _idx})
+                flat_labels.append({"text": str(k), "x_center": _idx})
+                _idx += 1
+            elif isinstance(v, (int, float, str)):        # period -> single value
+                flat_pts.append({"series": "", "value": v, "x_center": _idx})
+                flat_labels.append({"text": str(k), "x_center": _idx})
+                _idx += 1
+        if flat_pts:
+            points = flat_pts
+            if not xlabels:
+                xlabels = flat_labels
+    # normalise each point -> series / value / unit / x_center. Only keep dict
+    # points with a usable value (guards against malformed output leaking raw
+    # JSON fragments into the fields).
+    norm = []
+    for p in (points if isinstance(points, list) else []):
+        if not isinstance(p, dict):
+            continue
+        series = p.get("series") or p.get("label") or p.get("field_name") or ""
+        value = p.get("value")
+        if value is None or str(value).strip() == "":
+            continue
+        norm.append({"series": str(series).strip(),
+                     "value": value,
+                     "unit": p.get("unit"),
+                     "x_center": p.get("x_center")})
+    norm_labels = []
+    for l in (xlabels if isinstance(xlabels, list) else []):
+        if isinstance(l, dict) and l.get("text"):
+            norm_labels.append({"text": str(l.get("text")).strip(),
+                                "x_center": l.get("x_center")})
+    return title, norm, norm_labels
+
+# CHANGE 2 — fix the title=title reference in the figure block. Find:
+                        fig_claims = _build_chart_claims_with_geometry(
+                            chart_title, pts, xlabels, el, filename, entity_ref,
+                            firm_xaxis_cfg, title=title)
+
+# Replace with
+                        fig_claims = _build_chart_claims_with_geometry(
+                            chart_title, pts, xlabels, el, filename, entity_ref,
+                            firm_xaxis_cfg,
+                            title=_prefix(current_title, current_section))
+
+# CHANGE 3 — strengthen the WITH_POS prompt. Find the END of CHART_DIGITISATION_PROMPT_WITH_POS:
+    "- Give the chart TITLE and each point's SERIES name (from the legend) so each "
+    "value can be traced to its chart and series.\n"
+    "- Output ONLY the JSON object."
+)
+
+# Replace with
+    "- Give the chart TITLE and each point's SERIES name (from the legend) so each "
+    "value can be traced to its chart and series.\n"
+    "- CRITICAL: return the points as a flat ARRAY under the key \"points\" -- "
+    "one object per bar/point with series, value, x_center. Do NOT key points by "
+    "month or category. Do NOT nest objects. Follow the schema exactly.\n"
+    "- Output ONLY the JSON object."
+)
+
+    
