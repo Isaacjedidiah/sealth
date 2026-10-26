@@ -257,4 +257,51 @@ def _sonnet_read_image_with_pos(
     "- Output ONLY the JSON object."
 )
 
-    
+# firm xaxis
+    elements = sorted(detected_bars, key=lambda b: float(b.get('x_center', 0)))
+
+    # --- STEP 1: cluster markers at the SAME x into raw groups (stacked bars,
+    #     a bar + its dot, overlapping series share ONE x-position). ---
+    raw = []
+    for element in elements:
+        x = float(element.get("x_center", 0))
+        if raw and abs(x - raw[-1]["x_center"]) <= x_tolerance:
+            raw[-1]["elements"].append(element)
+            raw[-1]["x_center"] = sum(float(e.get("x_center", 0))
+                                      for e in raw[-1]["elements"]) / len(raw[-1]["elements"])
+        else:
+            raw.append({"x_center": x, "elements": [element]})
+
+    # --- STEP 2: derive the EVEN grid step from the gaps between raw groups.
+    #     Using the MEDIAN positive gap makes the step robust to a missing
+    #     position (a gap that is 2x the step) or an extra marker. ---
+    typical_gap = None
+    if len(raw) >= 2:
+        gaps = [raw[i+1]["x_center"] - raw[i]["x_center"] for i in range(len(raw)-1)]
+        pos = [g for g in gaps if g > 0]
+        typical_gap = median(pos) if pos else None
+
+    # --- STEP 3: place each raw group on an EVEN GRID. slot_index = how many
+    #     steps it sits from the FIRST group. A missing period leaves a GAP in
+    #     the indices (so the month maths stays correct); two groups a double-gap
+    #     apart get indices 0 and 2, NOT 0 and 1. This fixes:
+    #       * leading unlabeled period dropped (it still gets its own index),
+    #       * off-by-N from phantom/merged slots (index comes from position),
+    #       * stacked bars / dots sharing a position (same index). ---
+    slots = []
+    if typical_gap and typical_gap > 0:
+        x0 = raw[0]["x_center"]
+        used = {}
+        for g in raw:
+            idx = int(round((g["x_center"] - x0) / typical_gap))
+            if idx in used:
+                # two groups collapsed onto one index: keep separate by nudging
+                # the later one forward (defensive; rare).
+                idx = max(used) + 1
+            used[idx] = True
+            slots.append({"x_center": g["x_center"], "elements": g["elements"],
+                          "slot_index": idx})
+    else:
+        for i, g in enumerate(raw):
+            slots.append({"x_center": g["x_center"], "elements": g["elements"],
+                          "slot_index": i})
