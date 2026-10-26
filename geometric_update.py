@@ -349,3 +349,274 @@ def _sonnet_read_image_with_pos(
         # a year label that found no free slot still anchors on its nearest slot
         if not placed and is_year:
             assignments[cands[0]["slot_index"]] = text
+
+
+# FILE 1: firm_xaxis.py — ADD this new function at the END of the file:
+
+def resolve_periods_by_order(slots_in, monthly_step=1):
+    """slots_in: list of {index, label} in left-to-right order (one per x-axis
+    position). label is the printed x-axis label for that slot, or "" if none.
+    Returns {slot_index: period_string}, status.
+
+    status: "geometry" (full dates, year anchored), "geometry_month" (month-only,
+    no year on axis), "flag" (validation failed), "normal" (not a date/number axis).
+    """
+    if not slots_in:
+        return {}, "normal"
+    slots = sorted(slots_in, key=lambda s: s.get("index", 0))
+    for i, s in enumerate(slots):
+        s["_i"] = i
+
+    def _parse_date(text):
+        cleaned = re.sub(r"\s+", " ", str(text).replace("'", "").replace("`", "").strip())
+        for fmt in ("%B %Y", "%b %Y", "%B %y", "%b %y", "%B-%Y", "%b-%Y",
+                    "%B-%y", "%b-%y", "%Y-%m"):
+            try:
+                p = datetime.strptime(cleaned, fmt)
+                return {"month": p.month, "year": p.year, "had_year": True}
+            except ValueError:
+                continue
+        m = _MONTHS.get(cleaned.lower().rstrip("."))
+        if m:
+            return {"month": m, "year": None, "had_year": False}
+        return None
+
+    def _parse_number(text):
+        cleaned = str(text).strip().rstrip(".")
+        return float(cleaned) if re.fullmatch(r"-?\d+(?:\.\d+)?", cleaned) else None
+
+    date_anchors, num_anchors = [], []
+    for s in slots:
+        txt = str(s.get("label", "")).strip()
+        if not txt:
+            continue
+        d = _parse_date(txt)
+        if d:
+            date_anchors.append((s["_i"], d, txt))
+            continue
+        n = _parse_number(txt)
+        if n is not None:
+            num_anchors.append((s["_i"], n, txt))
+
+    is_date = len(date_anchors) >= len(num_anchors) and len(date_anchors) > 0
+    is_num = (not is_date) and len(num_anchors) > 0
+
+    if is_date:
+        year_anchors = [(i, d) for (i, d, _) in date_anchors if d["had_year"]]
+        if year_anchors:
+            anchor_i, a = sorted(year_anchors, key=lambda x: x[0])[0]
+            anchor_date = datetime(a["year"], a["month"], 1)
+            period = {}
+            for s in slots:
+                diff = s["_i"] - anchor_i
+                period[s["index"]] = (anchor_date
+                    + relativedelta(months=diff * monthly_step)).strftime("%B %Y")
+            valid = True
+            for (i, d, _) in date_anchors:
+                si = next(s["index"] for s in slots if s["_i"] == i)
+                dd = datetime.strptime(period[si], "%B %Y")
+                if dd.month != d["month"] or (d["had_year"] and dd.year != d["year"]):
+                    valid = False
+            return period, ("geometry" if valid else "flag")
+        anchor_i, a0, _ = sorted(date_anchors, key=lambda x: x[0])[0]
+        period = {}
+        for s in slots:
+            diff = s["_i"] - anchor_i
+            mnum = ((a0["month"] - 1) + diff * monthly_step) % 12 + 1
+            period[s["index"]] = datetime(2000, mnum, 1).strftime("%B")
+        valid = True
+        for (i, d, _) in date_anchors:
+            si = next(s["index"] for s in slots if s["_i"] == i)
+            if period[si] != datetime(2000, d["month"], 1).strftime("%B"):
+                valid = False
+        return period, ("geometry_month" if valid else "flag")
+
+    if is_num:
+        na = sorted(num_anchors, key=lambda x: x[0])
+        (i0, n0, _), (i1, n1, _) = na[0], na[-1]
+        span = i1 - i0
+        step = ((n1 - n0) / span) if span else 1
+        step = step or 1
+        def _fmt(v): return str(int(v)) if float(v).is_integer() else str(v)
+        period = {}
+        for s in slots:
+            v = n0 + (s["_i"] - i0) * step
+            period[s["index"]] = _fmt(v)
+        valid = all(_fmt(n) == period[next(s["index"] for s in slots if s["_i"] == i)]
+                    for (i, n, _) in num_anchors)
+        return period, ("geometry" if valid else "flag")
+
+    return {}, "normal"
+
+# FILE 2: hybrid_extraction.py — four changes:
+
+# 2a — the prompt. Replace CHART_DIGITISATION_PROMPT_WITH_POS = (...) with:
+
+CHART_DIGITISATION_PROMPT_WITH_POS = (
+    "You are a chart digitisation engine for bar, line AND dot/scatter charts. "
+    "Read the chart LEFT TO RIGHT and record, via the tool:\n"
+    "- chart_title: the title exactly as printed.\n"
+    "- legend: the name of EVERY series.\n"
+    "- slots: ONE entry per x-axis POSITION, in left-to-right ORDER (slot_index "
+    "0,1,2,...). For each slot give: slot_index; label (the x-axis label printed "
+    "under that position, or \"\" if that position has NO printed label); and "
+    "values = a list of {series, value, value_source} for EVERY series at that "
+    "position (bars, line vertices AND dots stacked/grouped at that x).\n"
+    "- value: if a number is PRINTED on/beside the marker use it EXACTLY "
+    "(value_source=\"printed\"); if not, ESTIMATE from the marker height against "
+    "the y-axis (value_source=\"estimated\"). Never skip a marker.\n"
+    "Return EVERY x-axis position as a slot, in order, even positions with NO "
+    "printed label (their period is filled by order afterwards). Do NOT use pixel "
+    "positions; the ORDER of the slots is what matters. Output ONLY the JSON."
+)
+
+# 2b — the schema. Replace the _POS_SCHEMA = {...} block (inside _sonnet_read_image_with_pos) with:
+
+    _POS_SCHEMA = {
+        "name": "record_chart_by_order",
+        "description": "Record a chart's title, legend and its x-axis positions "
+                       "(slots) in left-to-right order; each slot has its printed "
+                       "label (or empty) and the values of every series there.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chart_title": {"type": "string"},
+                "legend": {"type": "array", "items": {"type": "string"}},
+                "slots": {
+                    "type": "array",
+                    "description": "One per x-axis position, left-to-right order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "slot_index": {"type": "integer",
+                                           "description": "0,1,2,... left to right."},
+                            "label": {"type": "string",
+                                      "description": "x-axis label printed under this "
+                                                     "position, or empty if none."},
+                            "values": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "series": {"type": "string"},
+                                        "value": {"type": "string"},
+                                        "value_source": {"type": "string",
+                                                         "enum": ["printed", "estimated"]},
+                                    },
+                                    "required": ["series", "value"],
+                                },
+                            },
+                        },
+                        "required": ["slot_index", "label", "values"],
+                    },
+                },
+            },
+            "required": ["chart_title", "legend", "slots"],
+        },
+    }
+
+
+# 2c — the parser. In _sonnet_read_image_with_pos, replace everything from ta = getattr(resp, "tool_arguments", None) down to its return ... line with:
+    ta = getattr(resp, "tool_arguments", None)
+    data = ta if isinstance(ta, dict) else None
+    if data is None:
+        txt = getattr(resp, "text", "") or ""
+        m = _re.search(r"\{.*\}", txt, _re.S)
+        try:
+            data = _json.loads(m.group(0)) if m else {}
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    title = str(data.get("chart_title") or data.get("title") or "").strip()
+    raw_slots = data.get("slots") or []
+    slots = []
+    for i, s in enumerate(raw_slots if isinstance(raw_slots, list) else []):
+        if not isinstance(s, dict):
+            continue
+        idx = s.get("slot_index")
+        if idx is None:
+            idx = i
+        vals = []
+        for v in (s.get("values") or []):
+            if isinstance(v, dict) and v.get("value") not in (None, ""):
+                vals.append({"series": str(v.get("series", "") or "").strip(),
+                             "value": v.get("value"),
+                             "unit": v.get("unit")})
+        slots.append({"index": int(idx), "label": str(s.get("label", "") or "").strip(),
+                      "values": vals})
+    return title, slots
+
+
+# 2d — the builder. Replace the entire _build_chart_claims_with_geometry(...) function with:
+def _build_chart_claims_with_geometry(chart_title, slots, el, filename,
+                                      entity_ref, firm_xaxis_cfg, title=None):
+    """ORDER-BASED chart claims. slots is an ordered list of
+    {index, label, values:[{series,value,unit}]}. The geometry fills each slot's
+    PERIOD by ORDER, anchored on which slot carries a printed label (NOT pixels).
+    canonical_metric = <title> | <series> | <period>. All llm_estimated."""
+    from .firm_xaxis import resolve_periods_by_order
+    try:
+        from ..shared.schema import Claim as _Claim
+    except Exception:
+        _Claim = None
+
+    slot_period, status = ({}, "normal")
+    if any(s.get("label") for s in slots):
+        try:
+            slot_period, status = resolve_periods_by_order(
+                [{"index": s["index"], "label": s.get("label", "")} for s in slots],
+                monthly_step=firm_xaxis_cfg.get("monthly_step", 1))
+        except Exception:
+            slot_period, status = ({}, "normal")
+
+    prefix = (chart_title or "").strip() or (title or "").strip()
+    out = []
+    eid = f"{filename}-p{getattr(el, 'page', None)}-fig"
+    for s in slots:
+        period = slot_period.get(s["index"])
+        period = None if period == "FLAG_REVIEW" else period
+        for v in s.get("values", []):
+            series = str(v.get("series", "") or "").strip()
+            value = v.get("value")
+            if value is None or str(value).strip() == "":
+                continue
+            name = " | ".join(x for x in (prefix, series, period) if x) or series or "value"
+            claim_kwargs = dict(
+                field_name=series or "value", canonical_metric=name,
+                value=str(value), unit=v.get("unit"), element_type="figure",
+                source_element_id=eid, page=getattr(el, "page", None),
+                entity_ref=entity_ref, confidence=0.75,
+                model_used="sonnet_chart_order_geometry")
+            if period:
+                claim_kwargs["as_at_date"] = period
+            try:
+                from ..shared.schema import CitationTier
+                claim_kwargs["citation_tier"] = CitationTier.LLM_ESTIMATED
+            except Exception:
+                pass
+            if _Claim is not None:
+                out.append(_Claim(**claim_kwargs))
+    return out
+
+# 2e — the figure block call. Find:
+
+                    chart_title, pts, xlabels = _sonnet_read_image_with_pos(
+                        run_async_fn, llm_client, vision_model_key, content, img_b64)
+                    if pts:
+                        fig_claims = _build_chart_claims_with_geometry(
+                            chart_title, pts, xlabels, el, filename, entity_ref,
+                            firm_xaxis_cfg,
+                            title=_prefix(current_title, current_section))
+                        claims.extend(fig_claims)
+
+# Replace with:
+                    chart_title, chart_slots = _sonnet_read_image_with_pos(
+                        run_async_fn, llm_client, vision_model_key, content, img_b64)
+                    if chart_slots:
+                        fig_claims = _build_chart_claims_with_geometry(
+                            chart_title, chart_slots, el, filename, entity_ref,
+                            firm_xaxis_cfg,
+                            title=_prefix(current_title, current_section))
+                        claims.extend(fig_claims)
+
