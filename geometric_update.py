@@ -305,3 +305,47 @@ def _sonnet_read_image_with_pos(
         for i, g in enumerate(raw):
             slots.append({"x_center": g["x_center"], "elements": g["elements"],
                           "slot_index": i})
+
+# another update 20261026
+    # align each printed label to its nearest slot. A label's x can sit a little
+    # off its bar (multi-word labels, centring differences, CROWDED charts where
+    # bars are close together), so we use a GENEROUS threshold and NEVER drop a
+    # label that carries a YEAR -- losing the year anchor is worse than a
+    # slightly-off alignment, and is the main cause of "years not added" and of
+    # crowded charts collecting nothing. A label landing on an already-claimed
+    # slot takes the next-nearest free slot instead of overwriting.
+    def _has_year(txt):
+        t = re.sub(r"\s+", " ", str(txt).replace("'", "").replace("`", "").strip())
+        return bool(re.search(r"\b\d{2,4}\b", t)) or bool(re.search(r"\d{2}$", t))
+
+    assignments = {}
+    # place year-bearing labels FIRST (they anchor the timeline), then the rest,
+    # each nearest-first, skipping slots already taken.
+    ordered = sorted(detected_labels,
+                     key=lambda l: (not _has_year(l.get("text", "")),
+                                    float(l.get("x_center", 0))))
+    for label in ordered:
+        if not slots:
+            break
+        lx = float(label.get("x_center", 0))
+        text = label.get("text", "")
+        is_year = _has_year(text)
+        cands = sorted(slots, key=lambda s: abs(s["x_center"] - lx))
+        placed = False
+        for cand in cands:
+            if cand["slot_index"] in assignments:
+                continue                      # slot already has a label
+            # reject only NON-year labels that are implausibly far. On a CROWDED
+            # chart (small gap) the absolute offset can exceed the gap even for a
+            # correct label, so allow up to ~1.0 gap, and never below a small
+            # pixel floor so tight charts aren't over-rejected.
+            if typical_gap and not is_year:
+                tol = max(1.0 * typical_gap, 12.0)   # pixel floor for crowded charts
+                if abs(cand["x_center"] - lx) > tol:
+                    break
+            assignments[cand["slot_index"]] = text
+            placed = True
+            break
+        # a year label that found no free slot still anchors on its nearest slot
+        if not placed and is_year:
+            assignments[cands[0]["slot_index"]] = text
